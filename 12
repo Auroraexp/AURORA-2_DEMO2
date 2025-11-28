@@ -1,0 +1,290 @@
+AURORA-2-DEMO
+AURORA-2-DEMO/
+├─ backend/
+│  ├─ app/
+│  │  ├─ main.py
+│  │  ├─ kre.py
+│  │  ├─ os_module.py
+│  │  ├─ aurelia.py
+│  │  └─ model.py
+│  ├─ requirements.txt
+│  └─ Dockerfile
+├─ tests/
+│  ├─ sample_input.json
+│  └─ integration_test.sh
+└─ README.md
+backend/app/kre.py
+# kre.py
+import math
+
+def KRE_module(x0, w_K=0.28278):
+    """
+    Опрощена но ефективна имплементация на KAAN/KRE генератора.
+    В реална инсталация тук замени с твоята FKRE интегрална динамика.
+    Вход: x0 (скалар)
+    Изход: x_cand (скалар)
+    """
+    base = float(x0)
+    # примерна нелинейна динамика: комбинация от линеен растеж и синусоидална модулация
+    growth = 0.5 * base
+    oscillation = 0.1 * math.sin(base)
+    proposal = base + w_K * (growth + oscillation)
+    return proposal
+backend/app/os_module.py
+# os_module.py
+
+def OS_module(context_dict, w_OS=0.17866):
+    """
+    ОмниСфера коректор: приема контекст (dict) с ключове:
+      'Au', 'Ag', 'mineral', 'fe_cu', 'uid'
+    Ако липсват, използват се стойности по подразбиране.
+    Връща корекционен скалар.
+    """
+    try:
+        Au = float(context_dict.get('Au', 1.0))
+        Ag = float(context_dict.get('Ag', 1.0))
+        mineral = float(context_dict.get('mineral', 1.0))
+        fe_cu = float(context_dict.get('fe_cu', 1.0))
+        uid = float(context_dict.get('uid', 1.0))
+    except Exception:
+        # безопасна стойност при неправилен вход
+        Au = Ag = mineral = fe_cu = uid = 1.0
+
+    raw = Au + Ag + mineral + fe_cu + uid
+    # нормализираме чрез деление на максимален брой елементи (5)
+    corr = w_OS * (raw / 5.0)
+    return corr
+backend/app/aurelia.py
+# aurelia.py
+
+def NIM(I=1.0, E=1.0, C=1.0, A=1.0, S=1.0, eps=0.1):
+    """Информационно-аналитичен модул (опростен)."""
+    return (I + E + C + A + S) / 5.0
+
+def NOVEMBER(deltaC=1.0, Hs=0.5, El=0.3, Psir=0.8, Tn=1.0, Lam=1.0):
+    """Оценка на въздействие и риск (опростено)."""
+    return deltaC * (Hs + El) * Psir * (Tn ** 1.0) * Lam
+
+def AURELIA_module(context_dict, w_A=0.26789, eta=0.27, alpha=0.574, beta=0.426):
+    """
+    Комбинира NIM и NOVEMBER и връща скаларно коригиращо A_val.
+    Очаква в context_dict: I,E,C,A,S,eps, deltaC,Hs,El,Psir,Tn,Lam
+    """
+    nim = NIM(
+        I=context_dict.get('I', 1.0),
+        E=context_dict.get('E', 1.0),
+        C=context_dict.get('C', 1.0),
+        A=context_dict.get('A', 1.0),
+        S=context_dict.get('S', 1.0),
+        eps=context_dict.get('eps', 0.1)
+    )
+    november = NOVEMBER(
+        deltaC=context_dict.get('deltaC', 1.0),
+        Hs=context_dict.get('Hs', 0.5),
+        El=context_dict.get('El', 0.3),
+        Psir=context_dict.get('Psir', 0.8),
+        Tn=context_dict.get('Tn', 1.0),
+        Lam=context_dict.get('Lam', 1.0)
+    )
+    val = eta * (alpha * nim + beta * november)
+    return w_A * val
+backend/app/model.py
+# model.py
+from .kre import KRE_module
+from .os_module import OS_module
+from .aurelia import AURELIA_module
+
+WEIGHTS = {
+    'w_K': 0.28278,
+    'w_OS': 0.17866,
+    'w_A': 0.26789,
+    'w_G': 0.27067
+}
+
+def RESTART_iterative(x_cand, mu=0.1, iters=3):
+    """
+    Прост RESTART: няколко итерации на корекция.
+    Ползва приблизителен 'градиент' (тук – малка фракция).
+    """
+    x = x_cand
+    for _ in range(iters):
+        grad_est = 0.05 * x  # приблизителна оценка на градиента
+        x = x - mu * grad_est
+    return x
+
+def project_to_ethics(v, bounds=None):
+    """
+    Проекция върху множеството етично допустими действия.
+    Опростено: просто ограничаваме стойността в box constraints ако са дадени.
+    bounds = {'min':..., 'max':...}
+    """
+    if bounds is None:
+        return v
+    mn = bounds.get('min', None)
+    mx = bounds.get('max', None)
+    if mn is not None and v < mn:
+        return mn
+    if mx is not None and v > mx:
+        return mx
+    return v
+
+def aurora_step(x0, context, params=None):
+    """
+    Една стъпка на AURORA-2 pipeline:
+    1) KRE -> x_cand
+    2) RESTART -> x_raw
+    3) OmniSphere -> s_corr -> x_corr
+    4) AURELIA -> a_val
+    5) Етичен градиент и комбинация -> v -> проекция -> x_final
+    """
+    if params is None:
+        params = {}
+
+    # 1) KRE
+    x_cand = KRE_module(x0, w_K=WEIGHTS['w_K'])
+
+    # 2) RESTART
+    mu = params.get('mu', 0.1)
+    iters = params.get('restart_iters', 3)
+    x_raw = RESTART_iterative(x_cand, mu=mu, iters=iters)
+
+    # 3) OmniSphere correction
+    s_corr = OS_module(context, w_OS=WEIGHTS['w_OS'])
+    x_corr = x_raw + s_corr
+
+    # 4) AURELIA evaluation
+    a_val = AURELIA_module(context, w_A=WEIGHTS['w_A'])
+
+    # 5) ethical gradient (approx) and combine
+    grad_Leth = params.get('grad_Leth', 0.5)
+    eta = params.get('eta', 0.27)
+    v = x_corr + a_val - eta * grad_Leth
+
+    # 6) projection (box constraints example)
+    bounds = params.get('bounds', {'min': 0.0, 'max': 1e6})
+    x_final = project_to_ethics(v, bounds=bounds)
+
+    trace = {
+        'x_cand': x_cand,
+        'x_raw': x_raw,
+        's_corr': s_corr,
+        'a_val': a_val,
+        'v': v
+    }
+
+    return {'X_final': x_final, 'trace': trace}
+backend/app/main.py
+# main.py
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+from fastapi.middleware.cors import CORSMiddleware
+from .model import aurora_step
+
+app = FastAPI(title="AURORA-2 Demo API")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # за демо; при публикуване задай специфични origin
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+class AuroraInput(BaseModel):
+    x0: float
+    context: dict = {}
+    params: dict = {}
+
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
+
+@app.post("/aurora")
+async def run_aurora(inp: AuroraInput):
+    try:
+        res = aurora_step(inp.x0, inp.context, inp.params)
+        return res
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+backend/requirements.txt
+fastapi
+uvicorn[standard]
+pydantic
+backend/Dockerfile
+FROM python:3.11-slim
+WORKDIR /app
+COPY ./app /app
+RUN pip install --no-cache-dir -r requirements.txt
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+tests/sample_input.json
+{
+  "x0": 10,
+  "context": {
+    "I": 5,
+    "E": 3,
+    "C": 2,
+    "A": 1,
+    "S": 4,
+    "eps": 0.1,
+    "deltaC": 1.5,
+    "Hs": 0.5,
+    "El": 0.3,
+    "Psir": 0.8,
+    "Tn": 2,
+    "Lam": 1.2,
+    "Au": 1,
+    "Ag": 1,
+    "mineral": 1,
+    "fe_cu": 1,
+    "uid": 1
+  },
+  "params": {
+    "mu": 0.1,
+    "restart_iters": 3,
+    "grad_Leth": 0.5,
+    "eta": 0.27,
+    "bounds": {"min": 0, "max": 1000}
+  }
+}
+tests/integration_test.sh
+#!/usr/bin/env bash
+# integration_test.sh
+set -e
+BACKEND_URL=${BACKEND_URL:-http://localhost:8000}
+INPUT_FILE="tests/sample_input.json"
+echo "Posting to $BACKEND_URL/aurora ..."
+curl -s -X POST "$BACKEND_URL/aurora" -H "Content-Type: application/json" -d @"$INPUT_FILE" | jq .
+README.md
+# AURORA-2 Demo (FastAPI backend)
+
+Минимално, но работещо демо на AURORA-2 pipeline:
+KRE -> RESTART -> OmniSphere -> AURELIA -> Projection.
+
+## Локално стартиране (backend)
+1. cd backend
+2. python -m venv .venv
+3. source .venv/bin/activate    # Windows: .venv\Scripts\activate
+4. pip install -r requirements.txt
+5. uvicorn app.main:app --reload --port 8000
+
+## Тест (curl)
+curl -X POST http://localhost:8000/aurora -H "Content-Type: application/json" -d @tests/sample_input.json
+
+## Деплой
+Виж `Dockerfile`. Можеш да деплойнеш на Render, Railway, DigitalOcean и т.н.
+
+## Какво връща
+JSON с полета:
+- X_final: финалната стойност
+- trace: детайлен trace (x_cand, x_raw, s_corr, a_val, v)
+AURORA-2-DEMO
+
+# 1. Стартирай бекенд
+cd backend
+python -m venv .venv
+source .venv/bin/activate      # Windows: .venv\Scripts\activate
+pip install -r requirements.txt
+uvicorn app.main:app --reload --port 8000
+# 2. Тествай с sample input
+cd ../
+bash tests/integration_test.sh
